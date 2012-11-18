@@ -16,12 +16,11 @@
 #
 
 LOCAL_PATH := $(call my-dir)
+COMPILER_RT_PATH := $(LOCAL_PATH)
 
 #=====================================================================
 # Device Static Library: libbccCompilerRT
 #=====================================================================
-
-ifneq ($(TARGET_ARCH),mips)
 
 include $(CLEAR_VARS)
 
@@ -30,6 +29,9 @@ LOCAL_MODULE_TAGS := optional
 LOCAL_MODULE_CLASS := STATIC_LIBRARIES
 LOCAL_CLANG := true
 LOCAL_CFLAGS := -integrated-as
+
+# Pull in platform-independent functionality
+LOCAL_WHOLE_STATIC_LIBRARIES += libcompiler-rt-builtins libcompiler-rt-extras
 
 ifeq ($(TARGET_ARCH),arm)
 ifeq ($(ARCH_ARM_HAVE_ARMV7A),true)
@@ -87,13 +89,16 @@ else
       lib/i386/udivdi3.S \
       lib/i386/umoddi3.S
   else
-    $(error Unsupported TARGET_ARCH $(TARGET_ARCH))
+    ifeq ($(TARGET_ARCH),mips)
+      # nothing to add
+    else
+      $(error Unsupported TARGET_ARCH $(TARGET_ARCH))
+    endif
   endif
 endif
 
 include $(BUILD_STATIC_LIBRARY)
 
-endif # ifneq($(TARGET_ARCH),mips)
+include $(COMPILER_RT_PATH)/lib/Android.mk
 
-
-include $(LOCAL_PATH)/lib/asan/Android.mk
+include $(COMPILER_RT_PATH)/lib/asan/Android.mk

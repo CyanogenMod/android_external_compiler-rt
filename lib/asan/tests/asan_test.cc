@@ -1,4 +1,4 @@
-//===-- asan_test.cc ------------*- C++ -*-===//
+//===-- asan_test.cc ----------------------===//
 //
 //                     The LLVM Compiler Infrastructure
 //
@@ -33,12 +33,6 @@
 #include <AvailabilityMacros.h>  // For MAC_OS_X_VERSION_*
 #include <CoreFoundation/CFString.h>
 #endif  // __APPLE__
-
-#ifdef __APPLE__
-static bool APPLE = true;
-#else
-static bool APPLE = false;
-#endif
 
 #if ASAN_HAS_EXCEPTIONS
 # define ASAN_THROW(x) throw (x)
@@ -168,7 +162,7 @@ TEST(AddressSanitizer, VariousMallocsTest) {
   *c = 0;
   delete c;
 
-#if !defined(__APPLE__) && !defined(ANDROID)
+#if !defined(__APPLE__) && !defined(ANDROID) && !defined(__ANDROID__)
   // fprintf(stderr, "posix_memalign\n");
   int *pm;
   int pm_res = posix_memalign((void**)&pm, kPageSize, kPageSize);
@@ -423,10 +417,11 @@ TEST(AddressSanitizer, LargeMallocTest) {
 TEST(AddressSanitizer, HugeMallocTest) {
 #ifdef __APPLE__
   // It was empirically found out that 1215 megabytes is the maximum amount of
-  // memory available to the process under AddressSanitizer on Darwin.
+  // memory available to the process under AddressSanitizer on 32-bit Mac 10.6.
+  // 32-bit Mac 10.7 gives even less (< 1G).
   // (the libSystem malloc() allows allocating up to 2300 megabytes without
   // ASan).
-  size_t n_megs = __WORDSIZE == 32 ? 1200 : 4100;
+  size_t n_megs = __WORDSIZE == 32 ? 500 : 4100;
 #else
   size_t n_megs = __WORDSIZE == 32 ? 2600 : 4100;
 #endif
@@ -1231,8 +1226,9 @@ TEST(AddressSanitizer, StrCatOOBTest) {
   strcat(to, from);
   strcat(to, from);
   strcat(to + from_size, from + from_size - 2);
-  // Catenate empty string is not always an error.
-  strcat(to - 1, from + from_size - 1);
+  // Passing an invalid pointer is an error even when concatenating an empty
+  // string.
+  EXPECT_DEATH(strcat(to - 1, from + from_size - 1), LeftOOBErrorMessage(1));
   // One of arguments points to not allocated memory.
   EXPECT_DEATH(strcat(to - 1, from), LeftOOBErrorMessage(1));
   EXPECT_DEATH(strcat(to, from - 1), LeftOOBErrorMessage(1));
@@ -1251,6 +1247,47 @@ TEST(AddressSanitizer, StrCatOOBTest) {
   EXPECT_DEATH(strcat(to, from), RightOOBErrorMessage(0));
   // length of "to" is just enough.
   strcat(to, from + 1);
+
+  free(to);
+  free(from);
+}
+
+TEST(AddressSanitizer, StrNCatOOBTest) {
+  size_t to_size = Ident(100);
+  char *to = MallocAndMemsetString(to_size);
+  to[0] = '\0';
+  size_t from_size = Ident(20);
+  char *from = MallocAndMemsetString(from_size);
+  // Normal strncat calls.
+  strncat(to, from, 0);
+  strncat(to, from, from_size);
+  from[from_size - 1] = '\0';
+  strncat(to, from, 2 * from_size);
+  // Catenating empty string with an invalid string is still an error.
+  EXPECT_DEATH(strncat(to - 1, from, 0), LeftOOBErrorMessage(1));
+  strncat(to, from + from_size - 1, 10);
+  // One of arguments points to not allocated memory.
+  EXPECT_DEATH(strncat(to - 1, from, 2), LeftOOBErrorMessage(1));
+  EXPECT_DEATH(strncat(to, from - 1, 2), LeftOOBErrorMessage(1));
+  EXPECT_DEATH(strncat(to + to_size, from, 2), RightOOBErrorMessage(0));
+  EXPECT_DEATH(strncat(to, from + from_size, 2), RightOOBErrorMessage(0));
+
+  memset(from, 'z', from_size);
+  memset(to, 'z', to_size);
+  to[0] = '\0';
+  // "from" is too short.
+  EXPECT_DEATH(strncat(to, from, from_size + 1), RightOOBErrorMessage(0));
+  // "to" is not zero-terminated.
+  EXPECT_DEATH(strncat(to + 1, from, 1), RightOOBErrorMessage(0));
+  // "to" is too short to fit "from".
+  to[0] = 'z';
+  to[to_size - from_size + 1] = '\0';
+  EXPECT_DEATH(strncat(to, from, from_size - 1), RightOOBErrorMessage(0));
+  // "to" is just enough.
+  strncat(to, from, from_size - 2);
+
+  free(to);
+  free(from);
 }
 
 static string OverlapErrorMessage(const string &func) {
@@ -1300,12 +1337,24 @@ TEST(AddressSanitizer, StrArgsOverlapTest) {
   str[10] = '\0';
   str[20] = '\0';
   strcat(str, str + 10);
-  strcat(str, str + 11);
+  EXPECT_DEATH(strcat(str, str + 11), OverlapErrorMessage("strcat"));
   str[10] = '\0';
   strcat(str + 11, str);
   EXPECT_DEATH(strcat(str, str + 9), OverlapErrorMessage("strcat"));
   EXPECT_DEATH(strcat(str + 9, str), OverlapErrorMessage("strcat"));
   EXPECT_DEATH(strcat(str + 10, str), OverlapErrorMessage("strcat"));
+
+  // Check "strncat".
+  memset(str, 'z', size);
+  str[10] = '\0';
+  strncat(str, str + 10, 10);  // from is empty
+  EXPECT_DEATH(strncat(str, str + 11, 10), OverlapErrorMessage("strncat"));
+  str[10] = '\0';
+  str[20] = '\0';
+  strncat(str + 5, str, 5);
+  str[10] = '\0';
+  EXPECT_DEATH(strncat(str + 5, str, 6), OverlapErrorMessage("strncat"));
+  EXPECT_DEATH(strncat(str, str + 9, 10), OverlapErrorMessage("strncat"));
 
   free(str);
 }
@@ -1830,27 +1879,79 @@ TEST(AddressSanitizer, DISABLED_DemoTooMuchMemoryTest) {
     char *x = (char*)malloc(kAllocSize);
     memset(x, 0, kAllocSize);
     total_size += kAllocSize;
-    fprintf(stderr, "total: %ldM\n", (long)total_size >> 20);
+    fprintf(stderr, "total: %ldM %p\n", (long)total_size >> 20, x);
   }
+}
+
+// http://code.google.com/p/address-sanitizer/issues/detail?id=66
+TEST(AddressSanitizer, BufferOverflowAfterManyFrees) {
+  for (int i = 0; i < 1000000; i++) {
+    delete [] (Ident(new char [8644]));
+  }
+  char *x = new char[8192];
+  EXPECT_DEATH(x[Ident(8192)] = 0, "AddressSanitizer heap-buffer-overflow");
+  delete [] Ident(x);
 }
 
 #ifdef __APPLE__
 #include "asan_mac_test.h"
-// TODO(glider): figure out whether we still need these tests. Is it correct
-// to intercept CFAllocator?
-TEST(AddressSanitizerMac, DISABLED_CFAllocatorDefaultDoubleFree) {
+TEST(AddressSanitizerMac, CFAllocatorDefaultDoubleFree) {
   EXPECT_DEATH(
-      CFAllocatorDefaultDoubleFree(),
+      CFAllocatorDefaultDoubleFree(NULL),
       "attempting double-free");
 }
 
+void CFAllocator_DoubleFreeOnPthread() {
+  pthread_t child;
+  pthread_create(&child, NULL, CFAllocatorDefaultDoubleFree, NULL);
+  pthread_join(child, NULL);  // Shouldn't be reached.
+}
+
+TEST(AddressSanitizerMac, CFAllocatorDefaultDoubleFree_ChildPhread) {
+  EXPECT_DEATH(CFAllocator_DoubleFreeOnPthread(), "attempting double-free");
+}
+
+namespace {
+
+void *GLOB;
+
+void *CFAllocatorAllocateToGlob(void *unused) {
+  GLOB = CFAllocatorAllocate(NULL, 100, /*hint*/0);
+  return NULL;
+}
+
+void *CFAllocatorDeallocateFromGlob(void *unused) {
+  char *p = (char*)GLOB;
+  p[100] = 'A';  // ASan should report an error here.
+  CFAllocatorDeallocate(NULL, GLOB);
+  return NULL;
+}
+
+void CFAllocator_PassMemoryToAnotherThread() {
+  pthread_t th1, th2;
+  pthread_create(&th1, NULL, CFAllocatorAllocateToGlob, NULL);
+  pthread_join(th1, NULL);
+  pthread_create(&th2, NULL, CFAllocatorDeallocateFromGlob, NULL);
+  pthread_join(th2, NULL);
+}
+
+TEST(AddressSanitizerMac, CFAllocator_PassMemoryToAnotherThread) {
+  EXPECT_DEATH(CFAllocator_PassMemoryToAnotherThread(),
+               "heap-buffer-overflow");
+}
+
+}  // namespace
+
+// TODO(glider): figure out whether we still need these tests. Is it correct
+// to intercept the non-default CFAllocators?
 TEST(AddressSanitizerMac, DISABLED_CFAllocatorSystemDefaultDoubleFree) {
   EXPECT_DEATH(
       CFAllocatorSystemDefaultDoubleFree(),
       "attempting double-free");
 }
 
-TEST(AddressSanitizerMac, DISABLED_CFAllocatorMallocDoubleFree) {
+// We're intercepting malloc, so kCFAllocatorMalloc is routed to ASan.
+TEST(AddressSanitizerMac, CFAllocatorMallocDoubleFree) {
   EXPECT_DEATH(CFAllocatorMallocDoubleFree(), "attempting double-free");
 }
 
@@ -1984,6 +2085,13 @@ TEST(AddressSanitizerMac, CFStringCreateCopy) {
 TEST(AddressSanitizerMac, NSObjectOOB) {
   // Make sure that our allocators are used for NSObjects.
   EXPECT_DEATH(TestOOBNSObjects(), "heap-buffer-overflow");
+}
+
+// Make sure that correct pointer is passed to free() when deallocating a
+// NSURL object.
+// See http://code.google.com/p/address-sanitizer/issues/detail?id=70.
+TEST(AddressSanitizerMac, NSURLDeallocation) {
+  TestNSURLDeallocation();
 }
 #endif  // __APPLE__
 

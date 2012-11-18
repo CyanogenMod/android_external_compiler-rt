@@ -1,4 +1,4 @@
-//===-- asan_interceptors.cc ------------------------------------*- C++ -*-===//
+//===-- asan_interceptors.cc ----------------------------------------------===//
 //
 //                     The LLVM Compiler Infrastructure
 //
@@ -16,6 +16,7 @@
 #include "asan_internal.h"
 #include "asan_stack.h"
 
+#include <stddef.h>
 #include <new>
 
 namespace __asan {
@@ -31,7 +32,7 @@ using namespace __asan;  // NOLINT
   GET_STACK_TRACE_HERE_FOR_MALLOC;\
   return asan_memalign(0, size, &stack);
 
-#ifdef ANDROID
+#if ASAN_ANDROID
 void *operator new(size_t size) { OPERATOR_NEW_BODY; }
 void *operator new[](size_t size) { OPERATOR_NEW_BODY; }
 #else
