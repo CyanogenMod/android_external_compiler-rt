@@ -40,16 +40,12 @@
 #include <errno.h>
 #include <sched.h>
 #include <dlfcn.h>
+#define __need_res_state
+#include <resolv.h>
+#include <malloc.h>
 
 extern "C" int arch_prctl(int code, __sanitizer::uptr *addr);
-
-namespace __sanitizer {
-
-void Die() {
-  _exit(1);
-}
-
-}  // namespace __sanitizer
+extern "C" struct mallinfo __libc_mallinfo();
 
 namespace __tsan {
 
@@ -74,14 +70,79 @@ ScopedInRtl::~ScopedInRtl() {
 }
 #endif
 
-uptr GetShadowMemoryConsumption() {
-  return 0;
+static bool ishex(char c) {
+  return (c >= '0' && c <= '9')
+      || (c >= 'a' && c <= 'f');
+}
+
+static uptr readhex(const char *p) {
+  uptr v = 0;
+  for (; ishex(p[0]); p++) {
+    if (p[0] >= '0' && p[0] <= '9')
+      v = v * 16 + p[0] - '0';
+    else
+      v = v * 16 + p[0] - 'a' + 10;
+  }
+  return v;
+}
+
+static uptr readdec(const char *p) {
+  uptr v = 0;
+  for (; p[0] >= '0' && p[0] <= '9' ; p++)
+    v = v * 10 + p[0] - '0';
+  return v;
+}
+
+void WriteMemoryProfile(char *buf, uptr buf_size) {
+  char *smaps = 0;
+  uptr smaps_cap = 0;
+  uptr smaps_len = ReadFileToBuffer("/proc/self/smaps",
+      &smaps, &smaps_cap, 64<<20);
+  uptr mem[6] = {};
+  uptr total = 0;
+  uptr start = 0;
+  bool file = false;
+  const char *pos = smaps;
+  while (pos < smaps + smaps_len) {
+    if (ishex(pos[0])) {
+      start = readhex(pos);
+      for (; *pos != '/' && *pos > '\n'; pos++) {}
+      file = *pos == '/';
+    } else if (internal_strncmp(pos, "Rss:", 4) == 0) {
+      for (; *pos < '0' || *pos > '9'; pos++) {}
+      uptr rss = readdec(pos) * 1024;
+      total += rss;
+      start >>= 40;
+      if (start < 0x10)  // shadow
+        mem[0] += rss;
+      else if (start >= 0x20 && start < 0x30)  // compat modules
+        mem[file ? 1 : 2] += rss;
+      else if (start >= 0x7e)  // modules
+        mem[file ? 1 : 2] += rss;
+      else if (start >= 0x60 && start < 0x62)  // traces
+        mem[3] += rss;
+      else if (start >= 0x7d && start < 0x7e)  // heap
+        mem[4] += rss;
+      else  // other
+        mem[5] += rss;
+    }
+    while (*pos++ != '\n') {}
+  }
+  UnmapOrDie(smaps, smaps_cap);
+  char *buf_pos = buf;
+  char *buf_end = buf + buf_size;
+  buf_pos += internal_snprintf(buf_pos, buf_end - buf_pos,
+      "RSS %zd MB: shadow:%zd file:%zd mmap:%zd trace:%zd heap:%zd other:%zd\n",
+      total >> 20, mem[0] >> 20, mem[1] >> 20, mem[2] >> 20,
+      mem[3] >> 20, mem[4] >> 20, mem[5] >> 20);
+  struct mallinfo mi = __libc_mallinfo();
+  buf_pos += internal_snprintf(buf_pos, buf_end - buf_pos,
+      "mallinfo: arena=%d mmap=%d fordblks=%d keepcost=%d\n",
+      mi.arena >> 20, mi.hblkhd >> 20, mi.fordblks >> 20, mi.keepcost >> 20);
 }
 
 void FlushShadowMemory() {
-  madvise((void*)kLinuxShadowBeg,
-          kLinuxShadowEnd - kLinuxShadowBeg,
-          MADV_DONTNEED);
+  FlushUnneededShadowMemory(kLinuxShadowBeg, kLinuxShadowEnd - kLinuxShadowBeg);
 }
 
 #ifndef TSAN_GO
@@ -91,48 +152,43 @@ static void ProtectRange(uptr beg, uptr end) {
   if (beg == end)
     return;
   if (beg != (uptr)Mprotect(beg, end - beg)) {
-    TsanPrintf("FATAL: ThreadSanitizer can not protect [%zx,%zx]\n", beg, end);
-    TsanPrintf("FATAL: Make sure you are not using unlimited stack\n");
+    Printf("FATAL: ThreadSanitizer can not protect [%zx,%zx]\n", beg, end);
+    Printf("FATAL: Make sure you are not using unlimited stack\n");
     Die();
   }
 }
 #endif
 
+#ifndef TSAN_GO
 void InitializeShadowMemory() {
   uptr shadow = (uptr)MmapFixedNoReserve(kLinuxShadowBeg,
     kLinuxShadowEnd - kLinuxShadowBeg);
   if (shadow != kLinuxShadowBeg) {
-    TsanPrintf("FATAL: ThreadSanitizer can not mmap the shadow memory\n");
-    TsanPrintf("FATAL: Make sure to compile with -fPIE and "
+    Printf("FATAL: ThreadSanitizer can not mmap the shadow memory\n");
+    Printf("FATAL: Make sure to compile with -fPIE and "
                "to link with -pie (%p, %p).\n", shadow, kLinuxShadowBeg);
     Die();
   }
-#ifndef TSAN_GO
   const uptr kClosedLowBeg  = 0x200000;
   const uptr kClosedLowEnd  = kLinuxShadowBeg - 1;
   const uptr kClosedMidBeg = kLinuxShadowEnd + 1;
-  const uptr kClosedMidEnd = kLinuxAppMemBeg - 1;
+  const uptr kClosedMidEnd = min(kLinuxAppMemBeg, kTraceMemBegin);
   ProtectRange(kClosedLowBeg, kClosedLowEnd);
   ProtectRange(kClosedMidBeg, kClosedMidEnd);
-#endif
-#ifndef TSAN_GO
   DPrintf("kClosedLow   %zx-%zx (%zuGB)\n",
       kClosedLowBeg, kClosedLowEnd, (kClosedLowEnd - kClosedLowBeg) >> 30);
-#endif
   DPrintf("kLinuxShadow %zx-%zx (%zuGB)\n",
       kLinuxShadowBeg, kLinuxShadowEnd,
       (kLinuxShadowEnd - kLinuxShadowBeg) >> 30);
-#ifndef TSAN_GO
   DPrintf("kClosedMid   %zx-%zx (%zuGB)\n",
       kClosedMidBeg, kClosedMidEnd, (kClosedMidEnd - kClosedMidBeg) >> 30);
-#endif
   DPrintf("kLinuxAppMem %zx-%zx (%zuGB)\n",
       kLinuxAppMemBeg, kLinuxAppMemEnd,
       (kLinuxAppMemEnd - kLinuxAppMemBeg) >> 30);
   DPrintf("stack        %zx\n", (uptr)&shadow);
 }
+#endif
 
-static uptr g_tls_size;
 static uptr g_data_start;
 static uptr g_data_end;
 
@@ -142,12 +198,13 @@ static void CheckPIE() {
   MemoryMappingLayout proc_maps;
   uptr start, end;
   if (proc_maps.Next(&start, &end,
-                     /*offset*/0, /*filename*/0, /*filename_size*/0)) {
+                     /*offset*/0, /*filename*/0, /*filename_size*/0,
+                     /*protection*/0)) {
     if ((u64)start < kLinuxAppMemBeg) {
-      TsanPrintf("FATAL: ThreadSanitizer can not mmap the shadow memory ("
+      Printf("FATAL: ThreadSanitizer can not mmap the shadow memory ("
              "something is mapped at 0x%zx < 0x%zx)\n",
              start, kLinuxAppMemBeg);
-      TsanPrintf("FATAL: Make sure to compile with -fPIE"
+      Printf("FATAL: Make sure to compile with -fPIE"
              " and to link with -pie.\n");
       Die();
     }
@@ -159,10 +216,14 @@ static void InitDataSeg() {
   uptr start, end, offset;
   char name[128];
   bool prev_is_data = false;
-  while (proc_maps.Next(&start, &end, &offset, name, ARRAY_SIZE(name))) {
+  while (proc_maps.Next(&start, &end, &offset, name, ARRAY_SIZE(name),
+                        /*protection*/ 0)) {
     DPrintf("%p-%p %p %s\n", start, end, offset, name);
     bool is_data = offset != 0 && name[0] != 0;
-    bool is_bss = offset == 0 && name[0] == 0 && prev_is_data;
+    // BSS may get merged with [heap] in /proc/self/maps. This is not very
+    // reliable.
+    bool is_bss = offset == 0 &&
+      (name[0] == 0 || internal_strcmp(name, "[heap]") == 0) && prev_is_data;
     if (g_data_start == 0 && is_data)
       g_data_start = start;
     if (is_bss)
@@ -175,64 +236,76 @@ static void InitDataSeg() {
   CHECK_LT((uptr)&g_data_start, g_data_end);
 }
 
-#ifdef __i386__
-# define INTERNAL_FUNCTION __attribute__((regparm(3), stdcall))
-#else
-# define INTERNAL_FUNCTION
-#endif
-extern "C" void _dl_get_tls_static_info(size_t*, size_t*)
-    __attribute__((weak)) INTERNAL_FUNCTION;
-
-static int InitTlsSize() {
-  typedef void (*get_tls_func)(size_t*, size_t*) INTERNAL_FUNCTION;
-  get_tls_func get_tls = &_dl_get_tls_static_info;
-  if (get_tls == 0)
-    get_tls = (get_tls_func)dlsym(RTLD_NEXT, "_dl_get_tls_static_info");
-  CHECK_NE(get_tls, 0);
-  size_t tls_size = 0;
-  size_t tls_align = 0;
-  get_tls(&tls_size, &tls_align);
-  return tls_size;
-}
 #endif  // #ifndef TSAN_GO
+
+static rlim_t getlim(int res) {
+  rlimit rlim;
+  CHECK_EQ(0, getrlimit(res, &rlim));
+  return rlim.rlim_cur;
+}
+
+static void setlim(int res, rlim_t lim) {
+  // The following magic is to prevent clang from replacing it with memset.
+  volatile rlimit rlim;
+  rlim.rlim_cur = lim;
+  rlim.rlim_max = lim;
+  setrlimit(res, (rlimit*)&rlim);
+}
 
 const char *InitializePlatform() {
   void *p = 0;
   if (sizeof(p) == 8) {
     // Disable core dumps, dumping of 16TB usually takes a bit long.
-    // The following magic is to prevent clang from replacing it with memset.
-    volatile rlimit lim;
-    lim.rlim_cur = 0;
-    lim.rlim_max = 0;
-    setrlimit(RLIMIT_CORE, (rlimit*)&lim);
+    setlim(RLIMIT_CORE, 0);
+  }
+
+  // Go maps shadow memory lazily and works fine with limited address space.
+  // Unlimited stack is not a problem as well, because the executable
+  // is not compiled with -pie.
+  if (kCppMode) {
+    bool reexec = false;
+    // TSan doesn't play well with unlimited stack size (as stack
+    // overlaps with shadow memory). If we detect unlimited stack size,
+    // we re-exec the program with limited stack size as a best effort.
+    if (getlim(RLIMIT_STACK) == (rlim_t)-1) {
+      const uptr kMaxStackSize = 32 * 1024 * 1024;
+      Report("WARNING: Program is run with unlimited stack size, which "
+             "wouldn't work with ThreadSanitizer.\n");
+      Report("Re-execing with stack size limited to %zd bytes.\n",
+             kMaxStackSize);
+      SetStackSizeLimitInBytes(kMaxStackSize);
+      reexec = true;
+    }
+
+    if (getlim(RLIMIT_AS) != (rlim_t)-1) {
+      Report("WARNING: Program is run with limited virtual address space,"
+             " which wouldn't work with ThreadSanitizer.\n");
+      Report("Re-execing with unlimited virtual address space.\n");
+      setlim(RLIMIT_AS, -1);
+      reexec = true;
+    }
+    if (reexec)
+      ReExec();
   }
 
 #ifndef TSAN_GO
   CheckPIE();
-  g_tls_size = (uptr)InitTlsSize();
+  InitTlsSize();
   InitDataSeg();
 #endif
-  return getenv("TSAN_OPTIONS");
+  return GetEnv(kTsanOptionsEnv);
 }
 
 void FinalizePlatform() {
   fflush(0);
 }
 
-uptr GetTlsSize() {
-#ifndef TSAN_GO
-  return g_tls_size;
-#else
-  return 0;
-#endif
-}
-
 void GetThreadStackAndTls(bool main, uptr *stk_addr, uptr *stk_size,
                           uptr *tls_addr, uptr *tls_size) {
 #ifndef TSAN_GO
   arch_prctl(ARCH_GET_FS, tls_addr);
-  *tls_addr -= g_tls_size;
-  *tls_size = g_tls_size;
+  *tls_size = GetTlsSize();
+  *tls_addr -= *tls_size;
 
   uptr stack_top, stack_bottom;
   GetThreadStackTopAndBottom(main, &stack_top, &stack_bottom);
@@ -259,6 +332,19 @@ void GetThreadStackAndTls(bool main, uptr *stk_addr, uptr *stk_size,
 bool IsGlobalVar(uptr addr) {
   return g_data_start && addr >= g_data_start && addr < g_data_end;
 }
+
+#ifndef TSAN_GO
+int ExtractResolvFDs(void *state, int *fds, int nfd) {
+  int cnt = 0;
+  __res_state *statp = (__res_state*)state;
+  for (int i = 0; i < MAXNS && cnt < nfd; i++) {
+    if (statp->_u._ext.nsaddrs[i] && statp->_u._ext.nssocks[i] != -1)
+      fds[cnt++] = statp->_u._ext.nssocks[i];
+  }
+  return cnt;
+}
+#endif
+
 
 }  // namespace __tsan
 

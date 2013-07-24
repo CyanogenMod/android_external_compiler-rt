@@ -57,15 +57,20 @@ $(OBJROOT)/libcompiler_rt-%.dylib : $(OBJROOT)/darwin_bni/Release/%/libcompiler_
 	   $(OBJROOT)/version.c -arch $* -dynamiclib \
 	   -install_name /usr/lib/system/libcompiler_rt.dylib \
 	   -compatibility_version 1 -current_version $(RC_ProjectSourceVersion) \
-	   -nodefaultlibs -lSystem -umbrella System -dead_strip \
+	   -nodefaultlibs -umbrella System -dead_strip \
+	   -Wl,-upward-lunwind \
+	   -Wl,-upward-lsystem_m \
+	   -Wl,-upward-lsystem_c \
+	   -Wl,-ldyld \
+	   -Wl,-lsystem_kernel \
+	   -L$(SDKROOT)/usr/lib/system \
 	   $(DYLIB_FLAGS) -Wl,-force_load,$^ -o $@ 
 
 # Rule to make fat dylib
 $(SYMROOT)/libcompiler_rt.dylib: $(foreach arch,$(filter-out armv4t,$(RC_ARCHS)), \
                                         $(OBJROOT)/libcompiler_rt-$(arch).dylib)
 	$(call GetCNAVar,LIPO,Platform.darwin_bni,Release,) -create $^ -o  $@
-
-
+	$(call GetCNAVar,DSYMUTIL,Platform.darwin_bni,Release,) $@
 
 
 # Copy results to DSTROOT.

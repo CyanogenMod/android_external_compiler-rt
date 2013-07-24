@@ -37,14 +37,6 @@
 #include <errno.h>
 #include <sched.h>
 
-namespace __sanitizer {
-
-void Die() {
-  _exit(1);
-}
-
-}  // namespace __sanitizer
-
 namespace __tsan {
 
 ScopedInRtl::ScopedInRtl() {
@@ -60,13 +52,14 @@ uptr GetShadowMemoryConsumption() {
 void FlushShadowMemory() {
 }
 
+#ifndef TSAN_GO
 void InitializeShadowMemory() {
   uptr shadow = (uptr)MmapFixedNoReserve(kLinuxShadowBeg,
     kLinuxShadowEnd - kLinuxShadowBeg);
   if (shadow != kLinuxShadowBeg) {
-    TsanPrintf("FATAL: ThreadSanitizer can not mmap the shadow memory\n");
-    TsanPrintf("FATAL: Make sure to compile with -fPIE and "
-               "to link with -pie.\n");
+    Printf("FATAL: ThreadSanitizer can not mmap the shadow memory\n");
+    Printf("FATAL: Make sure to compile with -fPIE and "
+           "to link with -pie.\n");
     Die();
   }
   DPrintf("kLinuxShadow %zx-%zx (%zuGB)\n",
@@ -76,6 +69,7 @@ void InitializeShadowMemory() {
       kLinuxAppMemBeg, kLinuxAppMemEnd,
       (kLinuxAppMemEnd - kLinuxAppMemBeg) >> 30);
 }
+#endif
 
 const char *InitializePlatform() {
   void *p = 0;
@@ -88,15 +82,11 @@ const char *InitializePlatform() {
     setrlimit(RLIMIT_CORE, (rlimit*)&lim);
   }
 
-  return getenv("TSAN_OPTIONS");
+  return GetEnv(kTsanOptionsEnv);
 }
 
 void FinalizePlatform() {
   fflush(0);
-}
-
-uptr GetTlsSize() {
-  return 0;
 }
 
 void GetThreadStackAndTls(bool main, uptr *stk_addr, uptr *stk_size,

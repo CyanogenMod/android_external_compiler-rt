@@ -20,11 +20,10 @@ namespace __sanitizer {
 bool StartSymbolizerSubprocess(const char *path_to_symbolizer,
                                int *input_fd, int *output_fd) {
   UNIMPLEMENTED();
-  return false;
 }
 
 uptr GetListOfModules(LoadedModule *modules, uptr max_modules) {
-  UNIMPLEMENTED();
+  // FIXME: Actually implement this on Mac.
   return 0;
 }
 

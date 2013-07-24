@@ -42,7 +42,23 @@ typedef unsigned int uint64_t;
  * --- GCOV file format I/O primitives ---
  */
 
+/*
+ * The current file we're outputting.
+ */ 
 static FILE *output_file = NULL;
+
+/*
+ *  A list of flush functions that our __gcov_flush() function should call.
+ */
+typedef void (*flush_fn)();
+
+struct flush_fn_node {
+  flush_fn fn;
+  struct flush_fn_node *next;
+};
+
+struct flush_fn_node *flush_fn_head = NULL;
+struct flush_fn_node *flush_fn_tail = NULL;
 
 static void write_int32(uint32_t i) {
   fwrite(&i, 4, 1, output_file);
@@ -64,6 +80,24 @@ static void write_string(const char *s) {
   write_int32(len);
   fwrite(s, strlen(s), 1, output_file);
   fwrite("\0\0\0\0", 4 - (strlen(s) % 4), 1, output_file);
+}
+
+static uint32_t read_int32() {
+  uint32_t tmp;
+
+  if (fread(&tmp, 1, 4, output_file) != 4)
+    return (uint32_t)-1;
+
+  return tmp;
+}
+
+static uint64_t read_int64() {
+  uint64_t tmp;
+
+  if (fread(&tmp, 1, 8, output_file) != 8)
+    return (uint64_t)-1;
+
+  return tmp;
 }
 
 static char *mangle_filename(const char *orig_filename) {
@@ -127,32 +161,37 @@ static void recursive_mkdir(char *filename) {
  * profiling enabled will emit to a different file. Only one file may be
  * started at a time.
  */
-void llvm_gcda_start_file(const char *orig_filename) {
+void llvm_gcda_start_file(const char *orig_filename, const char version[4]) {
   char *filename = mangle_filename(orig_filename);
-  output_file = fopen(filename, "w+b");
+
+  /* Try just opening the file. */
+  output_file = fopen(filename, "r+b");
 
   if (!output_file) {
-    recursive_mkdir(filename);
+    /* Try opening the file, creating it if necessary. */
     output_file = fopen(filename, "w+b");
     if (!output_file) {
-      fprintf(stderr, "profiling:%s: cannot open\n", filename);
-      free(filename);
-      return;
+      /* Try creating the directories first then opening the file. */
+      recursive_mkdir(filename);
+      output_file = fopen(filename, "w+b");
+      if (!output_file) {
+        /* Bah! It's hopeless. */
+        fprintf(stderr, "profiling:%s: cannot open\n", filename);
+        free(filename);
+        return;
+      }
     }
   }
 
-  /* gcda file, version 404*, stamp LLVM. */
-#ifdef __APPLE__
-  fwrite("adcg*204MVLL", 12, 1, output_file);
-#else
-  fwrite("adcg*404MVLL", 12, 1, output_file);
-#endif
+  /* gcda file, version, stamp LLVM. */
+  fwrite("adcg", 4, 1, output_file);
+  fwrite(version, 4, 1, output_file);
+  fwrite("MVLL", 4, 1, output_file);
+  free(filename);
 
 #ifdef DEBUG_GCDAPROFILING
-  printf("llvmgcda: [%s]\n", orig_filename);
+  fprintf(stderr, "llvmgcda: [%s]\n", orig_filename);
 #endif
-
-  free(filename);
 }
 
 /* Given an array of pointers to counters (counters), increment the n-th one,
@@ -175,40 +214,82 @@ void llvm_gcda_increment_indirect_counter(uint32_t *predecessor,
 #ifdef DEBUG_GCDAPROFILING
   else
     fprintf(stderr,
-            "llvmgcda: increment_indirect_counter counters=%x, pred=%u\n",
-            state_table_row, *predecessor);
+            "llvmgcda: increment_indirect_counter counters=%08llx, pred=%u\n",
+            *counter, *predecessor);
 #endif
 }
 
-void llvm_gcda_emit_function(uint32_t ident, const char *function_name) {
+void llvm_gcda_emit_function(uint32_t ident, const char *function_name,
+                             uint8_t use_extra_checksum) {
+  uint32_t len = 2;
+  if (use_extra_checksum)
+    len++;
 #ifdef DEBUG_GCDAPROFILING
-  printf("llvmgcda: function id=%x\n", ident);
+  fprintf(stderr, "llvmgcda: function id=0x%08x name=%s\n", ident,
+          function_name ? function_name : "NULL");
 #endif
   if (!output_file) return;
 
-  /* function tag */  
+  /* function tag */
   fwrite("\0\0\0\1", 4, 1, output_file);
-  write_int32(3 + 1 + length_of_string(function_name));
+  if (function_name)
+    len += 1 + length_of_string(function_name);
+  write_int32(len);
   write_int32(ident);
   write_int32(0);
-  write_int32(0);
-  write_string(function_name);
+  if (use_extra_checksum)
+    write_int32(0);
+  if (function_name)
+    write_string(function_name);
 }
 
 void llvm_gcda_emit_arcs(uint32_t num_counters, uint64_t *counters) {
   uint32_t i;
+  uint64_t *old_ctrs = NULL;
+  uint32_t val = 0;
+  long pos = 0;
+
+  if (!output_file) return;
+
+  pos = ftell(output_file);
+  val = read_int32();
+
+  if (val != (uint32_t)-1) {
+    /* There are counters present in the file. Merge them. */
+    uint32_t j;
+
+    if (val != 0x01a10000) {
+      fprintf(stderr, "profiling: invalid magic number (0x%08x)\n", val);
+      return;
+    }
+
+    val = read_int32();
+    if (val == (uint32_t)-1 || val / 2 != num_counters) {
+      fprintf(stderr, "profiling: invalid number of counters (%d)\n", val);
+      return;
+    }
+
+    old_ctrs = malloc(sizeof(uint64_t) * num_counters);
+
+    for (j = 0; j < num_counters; ++j)
+      old_ctrs[j] = read_int64();
+  }
+
+  /* Reset for writing. */
+  fseek(output_file, pos, SEEK_SET);
 
   /* Counter #1 (arcs) tag */
-  if (!output_file) return;
   fwrite("\0\0\xa1\1", 4, 1, output_file);
   write_int32(num_counters * 2);
   for (i = 0; i < num_counters; ++i)
-    write_int64(counters[i]);
+    write_int64(counters[i] + (old_ctrs ? old_ctrs[i] : 0));
+
+  free(old_ctrs);
 
 #ifdef DEBUG_GCDAPROFILING
-  printf("llvmgcda:   %u arcs\n", num_counters);
+  fprintf(stderr, "llvmgcda:   %u arcs\n", num_counters);
   for (i = 0; i < num_counters; ++i)
-    printf("llvmgcda:   %llu\n", (unsigned long long)counters[i]);
+    fprintf(stderr, "llvmgcda:   %llu\n", (unsigned long long)counters[i]);
 #endif
 }
 
@@ -220,6 +301,38 @@ void llvm_gcda_end_file() {
   output_file = NULL;
 
 #ifdef DEBUG_GCDAPROFILING
-  printf("llvmgcda: -----\n");
+  fprintf(stderr, "llvmgcda: -----\n");
 #endif
+}
+
+void llvm_register_flush_function(flush_fn fn) {
+  struct flush_fn_node *new_node = malloc(sizeof(struct flush_fn_node));
+  new_node->fn = fn;
+  new_node->next = NULL;
+
+  if (!flush_fn_head) {
+    flush_fn_head = flush_fn_tail = new_node;
+  } else {
+    flush_fn_tail->next = new_node;
+    flush_fn_tail = new_node;
+  }
+}
+
+void __gcov_flush() {
+  struct flush_fn_node *curr = flush_fn_head;
+
+  while (curr) {
+    curr->fn();
+    curr = curr->next;
+  }
+}
+
+void llvm_delete_flush_function_list() {
+  while (flush_fn_head) {
+    struct flush_fn_node *node = flush_fn_head;
+    flush_fn_head = flush_fn_head->next;
+    free(node);
+  }
+
+  flush_fn_head = flush_fn_tail = NULL;
 }

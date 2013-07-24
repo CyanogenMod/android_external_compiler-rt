@@ -13,6 +13,12 @@
 //===----------------------------------------------------------------------===//
 
 #ifdef __APPLE__
+// Use 64-bit inodes in file operations. ASan does not support OS X 10.5, so
+// the clients will most certainly use 64-bit ones as well.
+#ifndef _DARWIN_USE_64_BIT_INODE
+#define _DARWIN_USE_64_BIT_INODE 1
+#endif
+#include <stdio.h>
 
 #include "sanitizer_common.h"
 #include "sanitizer_internal_defs.h"
@@ -30,6 +36,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <libkern/OSAtomic.h>
 
 namespace __sanitizer {
 
@@ -47,9 +54,17 @@ int internal_close(fd_t fd) {
   return close(fd);
 }
 
-fd_t internal_open(const char *filename, bool write) {
-  return open(filename,
-              write ? O_WRONLY | O_CREAT : O_RDONLY, 0660);
+fd_t internal_open(const char *filename, int flags) {
+  return open(filename, flags);
+}
+
+fd_t internal_open(const char *filename, int flags, u32 mode) {
+  return open(filename, flags, mode);
+}
+
+fd_t OpenFile(const char *filename, bool write) {
+  return internal_open(filename,
+      write ? O_WRONLY | O_CREAT : O_RDONLY, 0660);
 }
 
 uptr internal_read(fd_t fd, void *buf, uptr count) {
@@ -60,9 +75,21 @@ uptr internal_write(fd_t fd, const void *buf, uptr count) {
   return write(fd, buf, count);
 }
 
+int internal_stat(const char *path, void *buf) {
+  return stat(path, (struct stat *)buf);
+}
+
+int internal_lstat(const char *path, void *buf) {
+  return lstat(path, (struct stat *)buf);
+}
+
+int internal_fstat(fd_t fd, void *buf) {
+  return fstat(fd, (struct stat *)buf);
+}
+
 uptr internal_filesize(fd_t fd) {
   struct stat st;
-  if (fstat(fd, &st))
+  if (internal_fstat(fd, &st))
     return -1;
   return (uptr)st.st_size;
 }
@@ -79,7 +106,23 @@ int internal_sched_yield() {
   return sched_yield();
 }
 
+void internal__exit(int exitcode) {
+  _exit(exitcode);
+}
+
 // ----------------- sanitizer_common.h
+bool FileExists(const char *filename) {
+  struct stat st;
+  if (stat(filename, &st))
+    return false;
+  // Sanity check: filename is a regular file.
+  return S_ISREG(st.st_mode);
+}
+
+uptr GetTid() {
+  return reinterpret_cast<uptr>(pthread_self());
+}
+
 void GetThreadStackTopAndBottom(bool at_initialization, uptr *stack_top,
                                 uptr *stack_bottom) {
   CHECK(stack_top);
@@ -108,6 +151,14 @@ const char *GetEnv(const char *name) {
     environ++;
   }
   return 0;
+}
+
+void ReExec() {
+  UNIMPLEMENTED();
+}
+
+void PrepareForSandboxing() {
+  // Nothing here for now.
 }
 
 // ----------------- sanitizer_procmaps.h
@@ -143,6 +194,16 @@ void MemoryMappingLayout::Reset() {
   current_load_cmd_count_ = -1;
   current_load_cmd_addr_ = 0;
   current_magic_ = 0;
+  current_filetype_ = 0;
+}
+
+// static
+void MemoryMappingLayout::CacheMemoryMappings() {
+  // No-op on Mac for now.
+}
+
+void MemoryMappingLayout::LoadFromCache() {
+  // No-op on Mac for now.
 }
 
 // Next and NextSegmentLoad were inspired by base/sysinfo.cc in
@@ -155,7 +216,9 @@ void MemoryMappingLayout::Reset() {
 template<u32 kLCSegment, typename SegmentCommand>
 bool MemoryMappingLayout::NextSegmentLoad(
     uptr *start, uptr *end, uptr *offset,
-    char filename[], uptr filename_size) {
+    char filename[], uptr filename_size, uptr *protection) {
+  if (protection)
+    UNIMPLEMENTED();
   const char* lc = current_load_cmd_addr_;
   current_load_cmd_addr_ += ((const load_command *)lc)->cmdsize;
   if (((const load_command *)lc)->cmd == kLCSegment) {
@@ -163,7 +226,13 @@ bool MemoryMappingLayout::NextSegmentLoad(
     const SegmentCommand* sc = (const SegmentCommand *)lc;
     if (start) *start = sc->vmaddr + dlloff;
     if (end) *end = sc->vmaddr + sc->vmsize + dlloff;
-    if (offset) *offset = sc->fileoff;
+    if (offset) {
+      if (current_filetype_ == /*MH_EXECUTE*/ 0x2) {
+        *offset = sc->vmaddr;
+      } else {
+        *offset = sc->fileoff;
+      }
+    }
     if (filename) {
       internal_strncpy(filename, _dyld_get_image_name(current_image_),
                        filename_size);
@@ -174,7 +243,8 @@ bool MemoryMappingLayout::NextSegmentLoad(
 }
 
 bool MemoryMappingLayout::Next(uptr *start, uptr *end, uptr *offset,
-                               char filename[], uptr filename_size) {
+                               char filename[], uptr filename_size,
+                               uptr *protection) {
   for (; current_image_ >= 0; current_image_--) {
     const mach_header* hdr = _dyld_get_image_header(current_image_);
     if (!hdr) continue;
@@ -182,6 +252,7 @@ bool MemoryMappingLayout::Next(uptr *start, uptr *end, uptr *offset,
       // Set up for this image;
       current_load_cmd_count_ = hdr->ncmds;
       current_magic_ = hdr->magic;
+      current_filetype_ = hdr->filetype;
       switch (current_magic_) {
 #ifdef MH_MAGIC_64
         case MH_MAGIC_64: {
@@ -205,14 +276,14 @@ bool MemoryMappingLayout::Next(uptr *start, uptr *end, uptr *offset,
 #ifdef MH_MAGIC_64
         case MH_MAGIC_64: {
           if (NextSegmentLoad<LC_SEGMENT_64, struct segment_command_64>(
-                  start, end, offset, filename, filename_size))
+                  start, end, offset, filename, filename_size, protection))
             return true;
           break;
         }
 #endif
         case MH_MAGIC: {
           if (NextSegmentLoad<LC_SEGMENT, struct segment_command>(
-                  start, end, offset, filename, filename_size))
+                  start, end, offset, filename, filename_size, protection))
             return true;
           break;
         }
@@ -226,8 +297,44 @@ bool MemoryMappingLayout::Next(uptr *start, uptr *end, uptr *offset,
 
 bool MemoryMappingLayout::GetObjectNameAndOffset(uptr addr, uptr *offset,
                                                  char filename[],
-                                                 uptr filename_size) {
-  return IterateForObjectNameAndOffset(addr, offset, filename, filename_size);
+                                                 uptr filename_size,
+                                                 uptr *protection) {
+  return IterateForObjectNameAndOffset(addr, offset, filename, filename_size,
+                                       protection);
+}
+
+BlockingMutex::BlockingMutex(LinkerInitialized) {
+  // We assume that OS_SPINLOCK_INIT is zero
+}
+
+BlockingMutex::BlockingMutex() {
+  internal_memset(this, 0, sizeof(*this));
+}
+
+void BlockingMutex::Lock() {
+  CHECK(sizeof(OSSpinLock) <= sizeof(opaque_storage_));
+  CHECK_EQ(OS_SPINLOCK_INIT, 0);
+  CHECK_NE(owner_, (uptr)pthread_self());
+  OSSpinLockLock((OSSpinLock*)&opaque_storage_);
+  CHECK(!owner_);
+  owner_ = (uptr)pthread_self();
+}
+
+void BlockingMutex::Unlock() {
+  CHECK(owner_ == (uptr)pthread_self());
+  owner_ = 0;
+  OSSpinLockUnlock((OSSpinLock*)&opaque_storage_);
+}
+
+void BlockingMutex::CheckLocked() {
+  CHECK_EQ((uptr)pthread_self(), owner_);
+}
+
+uptr GetTlsSize() {
+  return 0;
+}
+
+void InitTlsSize() {
 }
 
 }  // namespace __sanitizer

@@ -11,6 +11,7 @@
 //
 //===----------------------------------------------------------------------===//
 #include "sanitizer_common/sanitizer_common.h"
+#include "sanitizer_common/sanitizer_libc.h"
 #include "gtest/gtest.h"
 
 namespace __sanitizer {
@@ -63,4 +64,52 @@ TEST(SanitizerCommon, SortTest) {
   EXPECT_TRUE(IsSorted(array, 2));
 }
 
-}  // namespace sanitizer
+TEST(SanitizerCommon, MmapAlignedOrDie) {
+  uptr PageSize = GetPageSizeCached();
+  for (uptr size = 1; size <= 32; size *= 2) {
+    for (uptr alignment = 1; alignment <= 32; alignment *= 2) {
+      for (int iter = 0; iter < 100; iter++) {
+        uptr res = (uptr)MmapAlignedOrDie(
+            size * PageSize, alignment * PageSize, "MmapAlignedOrDieTest");
+        EXPECT_EQ(0U, res % (alignment * PageSize));
+        internal_memset((void*)res, 1, size * PageSize);
+        UnmapOrDie((void*)res, size * PageSize);
+      }
+    }
+  }
+}
+
+#ifdef __linux__
+TEST(SanitizerCommon, SanitizerSetThreadName) {
+  const char *names[] = {
+    "0123456789012",
+    "01234567890123",
+    "012345678901234",  // Larger names will be truncated on linux.
+  };
+
+  for (size_t i = 0; i < ARRAY_SIZE(names); i++) {
+    EXPECT_TRUE(SanitizerSetThreadName(names[i]));
+    char buff[100];
+    EXPECT_TRUE(SanitizerGetThreadName(buff, sizeof(buff) - 1));
+    EXPECT_EQ(0, internal_strcmp(buff, names[i]));
+  }
+}
+#endif
+
+TEST(SanitizerCommon, InternalVector) {
+  InternalVector<uptr> vector(1);
+  for (uptr i = 0; i < 100; i++) {
+    EXPECT_EQ(i, vector.size());
+    vector.push_back(i);
+  }
+  for (uptr i = 0; i < 100; i++) {
+    EXPECT_EQ(i, vector[i]);
+  }
+  for (int i = 99; i >= 0; i--) {
+    EXPECT_EQ((uptr)i, vector.back());
+    vector.pop_back();
+    EXPECT_EQ((uptr)i, vector.size());
+  }
+}
+
+}  // namespace __sanitizer

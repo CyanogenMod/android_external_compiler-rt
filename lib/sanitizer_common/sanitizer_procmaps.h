@@ -15,6 +15,7 @@
 #define SANITIZER_PROCMAPS_H
 
 #include "sanitizer_internal_defs.h"
+#include "sanitizer_mutex.h"
 
 namespace __sanitizer {
 
@@ -23,34 +24,56 @@ class MemoryMappingLayout {
  public:
   MemoryMappingLayout() {}
   bool GetObjectNameAndOffset(uptr addr, uptr *offset,
-                              char filename[], uptr filename_size) {
+                              char filename[], uptr filename_size,
+                              uptr *protection) {
     UNIMPLEMENTED();
-    return false;
   }
 };
 
 #else  // _WIN32
+#if defined(__linux__)
+struct ProcSelfMapsBuff {
+  char *data;
+  uptr mmaped_size;
+  uptr len;
+};
+#endif  // defined(__linux__)
+
 class MemoryMappingLayout {
  public:
   MemoryMappingLayout();
   bool Next(uptr *start, uptr *end, uptr *offset,
-            char filename[], uptr filename_size);
+            char filename[], uptr filename_size, uptr *protection);
   void Reset();
   // Gets the object file name and the offset in that object for a given
   // address 'addr'. Returns true on success.
   bool GetObjectNameAndOffset(uptr addr, uptr *offset,
-                              char filename[], uptr filename_size);
+                              char filename[], uptr filename_size,
+                              uptr *protection);
+  // In some cases, e.g. when running under a sandbox on Linux, ASan is unable
+  // to obtain the memory mappings. It should fall back to pre-cached data
+  // instead of aborting.
+  static void CacheMemoryMappings();
   ~MemoryMappingLayout();
 
+  // Memory protection masks.
+  static const uptr kProtectionRead = 1;
+  static const uptr kProtectionWrite = 2;
+  static const uptr kProtectionExecute = 4;
+  static const uptr kProtectionShared = 8;
+
  private:
+  void LoadFromCache();
   // Default implementation of GetObjectNameAndOffset.
   // Quite slow, because it iterates through the whole process map for each
   // lookup.
   bool IterateForObjectNameAndOffset(uptr addr, uptr *offset,
-                                     char filename[], uptr filename_size) {
+                                     char filename[], uptr filename_size,
+                                     uptr *protection) {
     Reset();
     uptr start, end, file_offset;
-    for (int i = 0; Next(&start, &end, &file_offset, filename, filename_size);
+    for (int i = 0; Next(&start, &end, &file_offset, filename, filename_size,
+                         protection);
          i++) {
       if (addr >= start && addr < end) {
         // Don't subtract 'start' for the first entry:
@@ -74,16 +97,20 @@ class MemoryMappingLayout {
   }
 
 # if defined __linux__
-  char *proc_self_maps_buff_;
-  uptr proc_self_maps_buff_mmaped_size_;
-  uptr proc_self_maps_buff_len_;
+  ProcSelfMapsBuff proc_self_maps_;
   char *current_;
+
+  // Static mappings cache.
+  static ProcSelfMapsBuff cached_proc_self_maps_;
+  static StaticSpinMutex cache_lock_;  // protects cached_proc_self_maps_.
 # elif defined __APPLE__
   template<u32 kLCSegment, typename SegmentCommand>
   bool NextSegmentLoad(uptr *start, uptr *end, uptr *offset,
-                       char filename[], uptr filename_size);
+                       char filename[], uptr filename_size,
+                       uptr *protection);
   int current_image_;
   u32 current_magic_;
+  u32 current_filetype_;
   int current_load_cmd_count_;
   char *current_load_cmd_addr_;
 # endif

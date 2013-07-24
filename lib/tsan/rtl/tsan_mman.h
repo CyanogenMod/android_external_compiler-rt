@@ -20,7 +20,9 @@ namespace __tsan {
 const uptr kDefaultAlignment = 16;
 
 void InitializeAllocator();
-void AlloctorThreadFinish(ThreadState *thr);
+void AllocatorThreadStart(ThreadState *thr);
+void AllocatorThreadFinish(ThreadState *thr);
+void AllocatorPrintStats();
 
 // For user allocations.
 void *user_alloc(ThreadState *thr, uptr pc, uptr sz,
@@ -29,9 +31,14 @@ void *user_alloc(ThreadState *thr, uptr pc, uptr sz,
 void user_free(ThreadState *thr, uptr pc, void *p);
 void *user_realloc(ThreadState *thr, uptr pc, void *p, uptr sz);
 void *user_alloc_aligned(ThreadState *thr, uptr pc, uptr sz, uptr align);
+uptr user_alloc_usable_size(ThreadState *thr, uptr pc, void *p);
 // Given the pointer p into a valid allocated block,
 // returns the descriptor of the block.
 MBlock *user_mblock(ThreadState *thr, void *p);
+
+// Invoking malloc/free hooks that may be installed by the user.
+void invoke_malloc_hook(void *ptr, uptr size);
+void invoke_free_hook(void *ptr);
 
 enum MBlockType {
   MBlockScopedBuf,
@@ -55,9 +62,10 @@ enum MBlockType {
   MBlockSuppression,
   MBlockExpectRace,
   MBlockSignal,
+  MBlockFD,
 
   // This must be the last.
-  MBlockTypeCount,
+  MBlockTypeCount
 };
 
 // For internal data structures.
