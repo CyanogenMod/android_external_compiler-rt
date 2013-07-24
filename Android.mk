@@ -34,7 +34,6 @@ LOCAL_CFLAGS := -integrated-as
 LOCAL_WHOLE_STATIC_LIBRARIES += libcompiler-rt-builtins libcompiler-rt-extras
 
 ifeq ($(TARGET_ARCH),arm)
-ifeq ($(ARCH_ARM_HAVE_ARMV7A),true)
   LOCAL_SRC_FILES += \
     lib/arm/adddf3vfp.S \
     lib/arm/addsf3vfp.S \
@@ -70,7 +69,6 @@ ifeq ($(ARCH_ARM_HAVE_ARMV7A),true)
     lib/arm/truncdfsf2vfp.S \
     lib/arm/unorddf2vfp.S \
     lib/arm/unordsf2vfp.S
-endif
 else
   ifeq ($(TARGET_ARCH),x86) # We don't support x86-64 right now
     LOCAL_SRC_FILES += \
