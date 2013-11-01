@@ -22,7 +22,8 @@ ReportDesc::ReportDesc()
     , locs(MBlockReportLoc)
     , mutexes(MBlockReportMutex)
     , threads(MBlockReportThread)
-    , sleep() {
+    , sleep()
+    , count() {
 }
 
 ReportMop::ReportMop()
@@ -46,6 +47,8 @@ const char *thread_name(char *buf, int tid) {
 static const char *ReportTypeString(ReportType typ) {
   if (typ == ReportTypeRace)
     return "data race";
+  if (typ == ReportTypeVptrRace)
+    return "data race on vptr (ctor/dtor vs virtual call)";
   if (typ == ReportTypeUseAfterFree)
     return "heap-use-after-free";
   if (typ == ReportTypeThreadLeak)
@@ -176,7 +179,8 @@ ReportStack *SkipTsanInternalFrames(ReportStack *ent) {
 void PrintReport(const ReportDesc *rep) {
   Printf("==================\n");
   const char *rep_typ_str = ReportTypeString(rep->typ);
-  Printf("WARNING: ThreadSanitizer: %s (pid=%d)\n", rep_typ_str, GetPid());
+  Printf("WARNING: ThreadSanitizer: %s (pid=%d)\n", rep_typ_str,
+         (int)internal_getpid());
 
   for (uptr i = 0; i < rep->stacks.Size(); i++) {
     if (i)
@@ -198,6 +202,9 @@ void PrintReport(const ReportDesc *rep) {
 
   for (uptr i = 0; i < rep->threads.Size(); i++)
     PrintThread(rep->threads[i]);
+
+  if (rep->typ == ReportTypeThreadLeak && rep->count > 1)
+    Printf("  And %d more similar thread leaks.\n\n", rep->count - 1);
 
   if (ReportStack *ent = SkipTsanInternalFrames(ChooseSummaryStack(rep)))
     ReportErrorSummary(rep_typ_str, ent->file, ent->line, ent->func);

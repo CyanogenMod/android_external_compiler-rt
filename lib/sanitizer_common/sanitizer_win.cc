@@ -11,7 +11,10 @@
 // run-time libraries and implements windows-specific functions from
 // sanitizer_libc.h.
 //===----------------------------------------------------------------------===//
-#ifdef _WIN32
+
+#include "sanitizer_platform.h"
+#if SANITIZER_WINDOWS
+
 #define WIN32_LEAN_AND_MEAN
 #define NOGDI
 #include <stdlib.h>
@@ -20,10 +23,13 @@
 
 #include "sanitizer_common.h"
 #include "sanitizer_libc.h"
-#include "sanitizer_placement_new.h"
 #include "sanitizer_mutex.h"
+#include "sanitizer_placement_new.h"
+#include "sanitizer_stacktrace.h"
 
 namespace __sanitizer {
+
+#include "sanitizer_syscall_generic.inc"
 
 // --------------------- sanitizer_common.h
 uptr GetPageSize() {
@@ -34,16 +40,28 @@ uptr GetMmapGranularity() {
   return 1U << 16;  // FIXME: is this configurable?
 }
 
+uptr GetMaxVirtualAddress() {
+  SYSTEM_INFO si;
+  GetSystemInfo(&si);
+  return (uptr)si.lpMaximumApplicationAddress;
+}
+
 bool FileExists(const char *filename) {
   UNIMPLEMENTED();
 }
 
-int GetPid() {
+uptr internal_getpid() {
   return GetProcessId(GetCurrentProcess());
 }
 
-uptr GetThreadSelf() {
+// In contrast to POSIX, on Windows GetCurrentThreadId()
+// returns a system-unique identifier.
+uptr GetTid() {
   return GetCurrentThreadId();
+}
+
+uptr GetThreadSelf() {
+  return GetTid();
 }
 
 void GetThreadStackTopAndBottom(bool at_initialization, uptr *stack_top,
@@ -112,7 +130,7 @@ void *MapFileToMemory(const char *file_name, uptr *buff_size) {
 }
 
 static const int kMaxEnvNameLength = 128;
-static const int kMaxEnvValueLength = 32767;
+static const DWORD kMaxEnvValueLength = 32767;
 
 namespace {
 
@@ -186,6 +204,10 @@ void SleepForMillis(int millis) {
   Sleep(millis);
 }
 
+u64 NanoTime() {
+  return 0;
+}
+
 void Abort() {
   abort();
   _exit(-1);  // abort is not NORETURN on Windows.
@@ -198,16 +220,16 @@ int Atexit(void (*function)(void)) {
 #endif
 
 // ------------------ sanitizer_libc.h
-void *internal_mmap(void *addr, uptr length, int prot, int flags,
-                    int fd, u64 offset) {
+uptr internal_mmap(void *addr, uptr length, int prot, int flags,
+                   int fd, u64 offset) {
   UNIMPLEMENTED();
 }
 
-int internal_munmap(void *addr, uptr length) {
+uptr internal_munmap(void *addr, uptr length) {
   UNIMPLEMENTED();
 }
 
-int internal_close(fd_t fd) {
+uptr internal_close(fd_t fd) {
   UNIMPLEMENTED();
 }
 
@@ -215,15 +237,15 @@ int internal_isatty(fd_t fd) {
   return _isatty(fd);
 }
 
-fd_t internal_open(const char *filename, int flags) {
+uptr internal_open(const char *filename, int flags) {
   UNIMPLEMENTED();
 }
 
-fd_t internal_open(const char *filename, int flags, u32 mode) {
+uptr internal_open(const char *filename, int flags, u32 mode) {
   UNIMPLEMENTED();
 }
 
-fd_t OpenFile(const char *filename, bool write) {
+uptr OpenFile(const char *filename, bool write) {
   UNIMPLEMENTED();
 }
 
@@ -243,15 +265,15 @@ uptr internal_write(fd_t fd, const void *buf, uptr count) {
   return ret;
 }
 
-int internal_stat(const char *path, void *buf) {
+uptr internal_stat(const char *path, void *buf) {
   UNIMPLEMENTED();
 }
 
-int internal_lstat(const char *path, void *buf) {
+uptr internal_lstat(const char *path, void *buf) {
   UNIMPLEMENTED();
 }
 
-int internal_fstat(fd_t fd, void *buf) {
+uptr internal_fstat(fd_t fd, void *buf) {
   UNIMPLEMENTED();
 }
 
@@ -259,7 +281,7 @@ uptr internal_filesize(fd_t fd) {
   UNIMPLEMENTED();
 }
 
-int internal_dup2(int oldfd, int newfd) {
+uptr internal_dup2(int oldfd, int newfd) {
   UNIMPLEMENTED();
 }
 
@@ -267,7 +289,7 @@ uptr internal_readlink(const char *path, char *buf, uptr bufsize) {
   UNIMPLEMENTED();
 }
 
-int internal_sched_yield() {
+uptr internal_sched_yield() {
   Sleep(0);
   return 0;
 }
@@ -325,6 +347,50 @@ uptr GetTlsSize() {
 }
 
 void InitTlsSize() {
+}
+
+void GetThreadStackAndTls(bool main, uptr *stk_addr, uptr *stk_size,
+                          uptr *tls_addr, uptr *tls_size) {
+#ifdef SANITIZER_GO
+  *stk_addr = 0;
+  *stk_size = 0;
+  *tls_addr = 0;
+  *tls_size = 0;
+#else
+  uptr stack_top, stack_bottom;
+  GetThreadStackTopAndBottom(main, &stack_top, &stack_bottom);
+  *stk_addr = stack_bottom;
+  *stk_size = stack_top - stack_bottom;
+  *tls_addr = 0;
+  *tls_size = 0;
+#endif
+}
+
+void GetStackTrace(StackTrace *stack, uptr max_s, uptr pc, uptr bp,
+                   uptr stack_top, uptr stack_bottom, bool fast) {
+  (void)fast;
+  (void)stack_top;
+  (void)stack_bottom;
+  stack->max_size = max_s;
+  void *tmp[kStackTraceMax];
+
+  // FIXME: CaptureStackBackTrace might be too slow for us.
+  // FIXME: Compare with StackWalk64.
+  // FIXME: Look at LLVMUnhandledExceptionFilter in Signals.inc
+  uptr cs_ret = CaptureStackBackTrace(1, stack->max_size, tmp, 0);
+  uptr offset = 0;
+  // Skip the RTL frames by searching for the PC in the stacktrace.
+  // FIXME: this doesn't work well for the malloc/free stacks yet.
+  for (uptr i = 0; i < cs_ret; i++) {
+    if (pc != (uptr)tmp[i])
+      continue;
+    offset = i;
+    break;
+  }
+
+  stack->size = cs_ret - offset;
+  for (uptr i = 0; i < stack->size; i++)
+    stack->trace[i] = (uptr)tmp[i + offset];
 }
 
 }  // namespace __sanitizer

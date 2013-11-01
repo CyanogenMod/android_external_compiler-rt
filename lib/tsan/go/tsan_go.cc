@@ -116,12 +116,14 @@ void __tsan_write(ThreadState *thr, void *addr, void *pc) {
 
 void __tsan_read_range(ThreadState *thr, void *addr, uptr size, uptr step,
                        void *pc) {
-  MemoryAccessRangeStep(thr, (uptr)pc, (uptr)addr, size, step, false);
+  (void)step;
+  MemoryAccessRange(thr, (uptr)pc, (uptr)addr, size, false);
 }
 
 void __tsan_write_range(ThreadState *thr, void *addr, uptr size, uptr step,
                         void *pc) {
-  MemoryAccessRangeStep(thr, (uptr)pc, (uptr)addr, size, step, true);
+  (void)step;
+  MemoryAccessRange(thr, (uptr)pc, (uptr)addr, size, true);
 }
 
 void __tsan_func_enter(ThreadState *thr, void *pc) {
@@ -184,7 +186,7 @@ void __tsan_finalizer_goroutine(ThreadState *thr) {
   AcquireGlobal(thr, 0);
 }
 
-#ifdef _WIN32
+#if SANITIZER_WINDOWS
 // MinGW gcc emits calls to the function.
 void ___chkstk_ms(void) {
 // The implementation must be along the lines of:
@@ -220,3 +222,11 @@ void ___chkstk_ms(void) {
 
 }  // extern "C"
 }  // namespace __tsan
+
+namespace __sanitizer {
+
+void SymbolizerPrepareForSandboxing() {
+  // Nothing to do here for Go.
+}
+
+}  // namespace __sanitizer

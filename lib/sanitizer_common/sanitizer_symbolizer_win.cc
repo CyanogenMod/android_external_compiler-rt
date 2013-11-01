@@ -11,7 +11,9 @@
 // run-time libraries.
 // Windows-specific implementation of symbolizer parts.
 //===----------------------------------------------------------------------===//
-#ifdef _WIN32
+
+#include "sanitizer_platform.h"
+#if SANITIZER_WINDOWS
 #include <windows.h>
 
 #include "sanitizer_internal_defs.h"
@@ -24,12 +26,17 @@ bool StartSymbolizerSubprocess(const char *path_to_symbolizer,
   UNIMPLEMENTED();
 }
 
-uptr GetListOfModules(LoadedModule *modules, uptr max_modules) {
+uptr GetListOfModules(LoadedModule *modules, uptr max_modules,
+                      string_predicate_t filter) {
   UNIMPLEMENTED();
 };
 
-const char *Demangle(const char *MangledName) {
-  return MangledName;
+void SymbolizerPrepareForSandboxing() {
+  // Do nothing on Windows.
+}
+
+const char *DemangleCXXABI(const char *name) {
+  return name;
 }
 
 }  // namespace __sanitizer

@@ -12,7 +12,8 @@
 // Mac-specific details.
 //===----------------------------------------------------------------------===//
 
-#ifdef __APPLE__
+#include "sanitizer_common/sanitizer_platform.h"
+#if SANITIZER_MAC
 
 #include "asan_interceptors.h"
 #include "asan_internal.h"
@@ -20,7 +21,7 @@
 #include "asan_mapping.h"
 #include "asan_stack.h"
 #include "asan_thread.h"
-#include "asan_thread_registry.h"
+#include "sanitizer_common/sanitizer_atomic.h"
 #include "sanitizer_common/sanitizer_libc.h"
 
 #include <crt_externs.h>  // for _NSGetArgv
@@ -52,15 +53,17 @@ void GetPcSpBp(void *context, uptr *pc, uptr *sp, uptr *bp) {
 # endif  // SANITIZER_WORDSIZE
 }
 
-int GetMacosVersion() {
+MacosVersion cached_macos_version = MACOS_VERSION_UNINITIALIZED;
+
+MacosVersion GetMacosVersionInternal() {
   int mib[2] = { CTL_KERN, KERN_OSRELEASE };
   char version[100];
   uptr len = 0, maxlen = sizeof(version) / sizeof(version[0]);
   for (uptr i = 0; i < maxlen; i++) version[i] = '\0';
   // Get the version length.
-  CHECK(sysctl(mib, 2, 0, &len, 0, 0) != -1);
-  CHECK(len < maxlen);
-  CHECK(sysctl(mib, 2, version, &len, 0, 0) != -1);
+  CHECK_NE(sysctl(mib, 2, 0, &len, 0, 0), -1);
+  CHECK_LT(len, maxlen);
+  CHECK_NE(sysctl(mib, 2, version, &len, 0, 0), -1);
   switch (version[0]) {
     case '9': return MACOS_VERSION_LEOPARD;
     case '1': {
@@ -68,11 +71,24 @@ int GetMacosVersion() {
         case '0': return MACOS_VERSION_SNOW_LEOPARD;
         case '1': return MACOS_VERSION_LION;
         case '2': return MACOS_VERSION_MOUNTAIN_LION;
+        case '3': return MACOS_VERSION_MAVERICKS;
         default: return MACOS_VERSION_UNKNOWN;
       }
     }
     default: return MACOS_VERSION_UNKNOWN;
   }
+}
+
+MacosVersion GetMacosVersion() {
+  atomic_uint32_t *cache =
+      reinterpret_cast<atomic_uint32_t*>(&cached_macos_version);
+  MacosVersion result =
+      static_cast<MacosVersion>(atomic_load(cache, memory_order_acquire));
+  if (result == MACOS_VERSION_UNINITIALIZED) {
+    result = GetMacosVersionInternal();
+    atomic_store(cache, result, memory_order_release);
+  }
+  return result;
 }
 
 bool PlatformHasDifferentMemcpyAndMemmove() {
@@ -229,18 +245,6 @@ bool AsanInterceptsSignal(int signum) {
 void AsanPlatformThreadInit() {
 }
 
-void GetStackTrace(StackTrace *stack, uptr max_s, uptr pc, uptr bp, bool fast) {
-  (void)fast;
-  stack->size = 0;
-  stack->trace[0] = pc;
-  if ((max_s) > 1) {
-    stack->max_size = max_s;
-    if (!asan_inited) return;
-    if (AsanThread *t = asanThreadRegistry().GetCurrent())
-      stack->FastUnwindStack(pc, bp, t->stack_top(), t->stack_bottom());
-  }
-}
-
 void ReadContextStack(void *context, uptr *stack, uptr *ssize) {
   UNIMPLEMENTED();
 }
@@ -288,14 +292,16 @@ typedef struct {
   u32 parent_tid;
 } asan_block_context_t;
 
-static ALWAYS_INLINE
+ALWAYS_INLINE
 void asan_register_worker_thread(int parent_tid, StackTrace *stack) {
-  AsanThread *t = asanThreadRegistry().GetCurrent();
+  AsanThread *t = GetCurrentThread();
   if (!t) {
-    t = AsanThread::Create(parent_tid, 0, 0, stack);
-    asanThreadRegistry().RegisterThread(t);
+    t = AsanThread::Create(0, 0);
+    CreateThreadContextArgs args = { t, stack };
+    asanThreadRegistry().CreateThread(*(uptr*)t, true, parent_tid, &args);
     t->Init();
-    asanThreadRegistry().SetCurrent(t);
+    asanThreadRegistry().StartThread(t->tid(), 0, 0);
+    SetCurrentThread(t);
   }
 }
 
@@ -329,7 +335,7 @@ asan_block_context_t *alloc_asan_context(void *ctxt, dispatch_function_t func,
       (asan_block_context_t*) asan_malloc(sizeof(asan_block_context_t), stack);
   asan_ctxt->block = ctxt;
   asan_ctxt->func = func;
-  asan_ctxt->parent_tid = asanThreadRegistry().GetCurrentTidOrInvalid();
+  asan_ctxt->parent_tid = GetCurrentTidOrInvalid();
   return asan_ctxt;
 }
 
@@ -395,7 +401,7 @@ void dispatch_source_set_event_handler(dispatch_source_t ds, void(^work)(void));
 
 #define GET_ASAN_BLOCK(work) \
   void (^asan_block)(void);  \
-  int parent_tid = asanThreadRegistry().GetCurrentTidOrInvalid(); \
+  int parent_tid = GetCurrentTidOrInvalid(); \
   asan_block = ^(void) { \
     GET_STACK_TRACE_THREAD; \
     asan_register_worker_thread(parent_tid, &stack); \
@@ -433,4 +439,4 @@ INTERCEPTOR(void, dispatch_source_set_event_handler,
 }
 #endif
 
-#endif  // __APPLE__
+#endif  // SANITIZER_MAC

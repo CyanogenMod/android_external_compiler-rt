@@ -22,11 +22,10 @@ ThreadContextBase::ThreadContextBase(u32 tid)
   name[0] = '\0';
 }
 
-#ifndef SANITIZER_GO
 ThreadContextBase::~ThreadContextBase() {
+  // ThreadContextBase should never be deleted.
   CHECK(0);
 }
-#endif
 
 void ThreadContextBase::SetName(const char *new_name) {
   name[0] = '\0';
@@ -77,16 +76,16 @@ void ThreadContextBase::SetCreated(uptr _user_id, u64 _unique_id,
   OnCreated(arg);
 }
 
-void ThreadContextBase::Reset(void *arg) {
+void ThreadContextBase::Reset() {
   status = ThreadStatusInvalid;
   reuse_count++;
   SetName(0);
-  OnReset(arg);
+  OnReset();
 }
 
 // ThreadRegistry implementation.
 
-const u32 ThreadRegistry::kUnknownTid = -1U;
+const u32 ThreadRegistry::kUnknownTid = ~0U;
 
 ThreadRegistry::ThreadRegistry(ThreadContextFactory factory, u32 max_threads,
                                u32 thread_quarantine_size)
@@ -102,6 +101,7 @@ ThreadRegistry::ThreadRegistry(ThreadContextFactory factory, u32 max_threads,
   threads_ = (ThreadContextBase **)MmapOrDie(max_threads_ * sizeof(threads_[0]),
                                              "ThreadRegistry");
   dead_threads_.clear();
+  invalid_threads_.clear();
 }
 
 void ThreadRegistry::GetNumberOfThreads(uptr *total, uptr *running,
@@ -121,25 +121,18 @@ u32 ThreadRegistry::CreateThread(uptr user_id, bool detached, u32 parent_tid,
                                  void *arg) {
   BlockingMutexLock l(&mtx_);
   u32 tid = kUnknownTid;
-  ThreadContextBase *tctx = 0;
-  if (dead_threads_.size() > thread_quarantine_size_ ||
-      n_contexts_ >= max_threads_) {
-    // Reusing old thread descriptor and tid.
-    if (dead_threads_.size() == 0) {
-      Report("%s: Thread limit (%u threads) exceeded. Dying.\n",
-             SanitizerToolName, max_threads_);
-      Die();
-    }
-    tctx = dead_threads_.front();
-    dead_threads_.pop_front();
-    CHECK_EQ(ThreadStatusDead, tctx->status);
-    tctx->Reset(arg);
+  ThreadContextBase *tctx = QuarantinePop();
+  if (tctx) {
     tid = tctx->tid;
-  } else {
+  } else if (n_contexts_ < max_threads_) {
     // Allocate new thread context and tid.
     tid = n_contexts_++;
     tctx = context_factory_(tid);
     threads_[tid] = tctx;
+  } else {
+    Report("%s: Thread limit (%u threads) exceeded. Dying.\n",
+           SanitizerToolName, max_threads_);
+    Die();
   }
   CHECK_NE(tctx, 0);
   CHECK_NE(tid, kUnknownTid);
@@ -187,6 +180,17 @@ ThreadRegistry::FindThreadContextLocked(FindThreadCallback cb, void *arg) {
   return 0;
 }
 
+static bool FindThreadContextByOsIdCallback(ThreadContextBase *tctx,
+                                            void *arg) {
+  return (tctx->os_id == (uptr)arg && tctx->status != ThreadStatusInvalid &&
+      tctx->status != ThreadStatusDead);
+}
+
+ThreadContextBase *ThreadRegistry::FindThreadContextByOsIDLocked(uptr os_id) {
+  return FindThreadContextLocked(FindThreadContextByOsIdCallback,
+                                 (void *)os_id);
+}
+
 void ThreadRegistry::SetThreadName(u32 tid, const char *name) {
   BlockingMutexLock l(&mtx_);
   CHECK_LT(tid, n_contexts_);
@@ -207,7 +211,7 @@ void ThreadRegistry::DetachThread(u32 tid) {
   }
   if (tctx->status == ThreadStatusFinished) {
     tctx->SetDead();
-    dead_threads_.push_back(tctx);
+    QuarantinePush(tctx);
   } else {
     tctx->detached = true;
   }
@@ -223,7 +227,7 @@ void ThreadRegistry::JoinThread(u32 tid, void *arg) {
     return;
   }
   tctx->SetJoined(arg);
-  dead_threads_.push_back(tctx);
+  QuarantinePush(tctx);
 }
 
 void ThreadRegistry::FinishThread(u32 tid) {
@@ -239,7 +243,7 @@ void ThreadRegistry::FinishThread(u32 tid) {
   tctx->SetFinished();
   if (tctx->detached) {
     tctx->SetDead();
-    dead_threads_.push_back(tctx);
+    QuarantinePush(tctx);
   }
 }
 
@@ -251,6 +255,25 @@ void ThreadRegistry::StartThread(u32 tid, uptr os_id, void *arg) {
   CHECK_NE(tctx, 0);
   CHECK_EQ(ThreadStatusCreated, tctx->status);
   tctx->SetStarted(os_id, arg);
+}
+
+void ThreadRegistry::QuarantinePush(ThreadContextBase *tctx) {
+  dead_threads_.push_back(tctx);
+  if (dead_threads_.size() <= thread_quarantine_size_)
+    return;
+  tctx = dead_threads_.front();
+  dead_threads_.pop_front();
+  CHECK_EQ(tctx->status, ThreadStatusDead);
+  tctx->Reset();
+  invalid_threads_.push_back(tctx);
+}
+
+ThreadContextBase *ThreadRegistry::QuarantinePop() {
+  if (invalid_threads_.size() == 0)
+    return 0;
+  ThreadContextBase *tctx = invalid_threads_.front();
+  invalid_threads_.pop_front();
+  return tctx;
 }
 
 }  // namespace __sanitizer
